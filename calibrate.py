@@ -1,143 +1,165 @@
 #!/usr/bin/env python3
 """
-Click-to-calibrate: mark GPS points on TH.png to build calibration.json.
+Corner calibration tool for GPS mini-map.
 
-Usage:
-    pip install opencv-python
-    python calibrate.py
+PHASE 1  (window)
+  Click every corner/waypoint on TH.png in lap order (CCW).
+  Each click drops a numbered dot.
+  Z = undo last click
+  D = done — move to phase 2
 
-Instructions:
-  1. The track map opens in a window.
-  2. Click each labelled GPS point IN ORDER (order listed in the window title).
-  3. Press Z to undo the last click.
-  4. When all points are clicked the file is saved automatically.
-  5. Press ESC at any time to quit without saving.
+PHASE 2  (terminal)
+  For each corner in order, look at your dash cam footage and type the
+  GPS shown on-screen when you passed that corner.
+  Accept either:
+    39.54075 122.33146
+    N:39.54075 W:122.33146
 
-Output: calibration.json (used by generate_minimap.py --map TH.png)
+Output: calibration.json  (used by generate_minimap.py --map TH.png)
 """
 
 import json
+import re
 import sys
+
 import cv2
 import numpy as np
 
 MAP_PATH   = "TH.png"
 CALIB_FILE = "calibration.json"
 
-# GPS points to calibrate — taken from dash cam GPS overlay
-# Identify where you were on TH.png at each timestamp and click there.
-POINTS = [
-    {
-        "label": "1 — 07:35:00  18 km/h  (just rolling out, first corner approach)",
-        "lat": 39.540752,
-        "lon": 122.331459,
-    },
-    {
-        "label": "2 — 07:35:19  92 km/h  (back straight, going fast)",
-        "lat": 39.536877,
-        "lon": 122.331230,
-    },
-]
+# ── state ────────────────────────────────────────────────────────────────────
+corners: list[dict] = []          # {px_orig, py_orig} filled in phase 1
+img_orig: np.ndarray = None        # original full-res image
+img_disp: np.ndarray = None        # scaled display image
+disp_scale: float = 1.0
+phase: int = 1
 
-# ── globals ─────────────────────────────────────────────────────────────────
-
-clicks: list[dict] = []
-img_orig: np.ndarray = None
-WIN = "Calibrate — click points in order  |  Z=undo  ESC=quit"
+WIN = "PHASE 1 — click corners CCW | Z=undo | D=done"
 
 
-def redraw() -> None:
-    display = img_orig.copy()
-    n = len(POINTS)
+# ── drawing ───────────────────────────────────────────────────────────────────
 
-    for i, c in enumerate(clicks):
-        col = (0, 180, 0)
-        cv2.circle(display, (c["px"], c["py"]), 9, col, -1, cv2.LINE_AA)
-        cv2.circle(display, (c["px"], c["py"]), 9, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(display, str(i + 1), (c["px"] + 11, c["py"] + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+def redraw(highlight: int = -1) -> None:
+    canvas = img_disp.copy()
+    n = len(corners)
+    for i, c in enumerate(corners):
+        px = int(c["px_orig"] * disp_scale)
+        py = int(c["py_orig"] * disp_scale)
+        col   = (0, 255, 120) if i == highlight else (0, 80, 255)
+        ring  = (255, 255, 255)
+        cv2.circle(canvas, (px, py), 8, col, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (px, py), 8, ring, 1,  cv2.LINE_AA)
+        cv2.putText(canvas, str(i + 1), (px + 10, py + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2, cv2.LINE_AA)
+        if i > 0:
+            prev = corners[i - 1]
+            cv2.line(canvas,
+                     (int(prev["px_orig"] * disp_scale), int(prev["py_orig"] * disp_scale)),
+                     (px, py), (0, 200, 80), 1, cv2.LINE_AA)
+    # Close loop preview
+    if n >= 3:
+        first = corners[0]
+        last  = corners[-1]
+        cv2.line(canvas,
+                 (int(last["px_orig"]  * disp_scale), int(last["py_orig"]  * disp_scale)),
+                 (int(first["px_orig"] * disp_scale), int(first["py_orig"] * disp_scale)),
+                 (0, 120, 60), 1, cv2.LINE_AA)
+    cv2.imshow(WIN, canvas)
 
-    if len(clicks) < n:
-        label = POINTS[len(clicks)]["label"]
-        bar = np.full((46, display.shape[1], 3), (30, 30, 30), dtype=np.uint8)
-        cv2.putText(bar, f"Click point {label}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1, cv2.LINE_AA)
-        display = np.vstack([bar, display])
-    else:
-        bar = np.full((46, display.shape[1], 3), (0, 80, 0), dtype=np.uint8)
-        cv2.putText(bar, "All points set — saving calibration.json…", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 120), 1, cv2.LINE_AA)
-        display = np.vstack([bar, display])
 
-    cv2.imshow(WIN, display)
-
-
-def on_mouse(event, x, y, flags, _param) -> None:
-    if event != cv2.EVENT_LBUTTONDOWN:
+def on_mouse(event, x, y, _flags, _param) -> None:
+    if phase != 1 or event != cv2.EVENT_LBUTTONDOWN:
         return
-    idx = len(clicks)
-    if idx >= len(POINTS):
-        return
-    p = POINTS[idx]
-    clicks.append({"label": p["label"], "lat": p["lat"], "lon": p["lon"],
-                   "px": x, "py": y - 46})   # offset for the instruction bar
-    print(f"  ✓ Point {idx + 1}: pixel ({x}, {y - 46})  GPS N:{p['lat']} W:{p['lon']}")
+    corners.append({"px_orig": x / disp_scale, "py_orig": y / disp_scale})
+    print(f"  corner {len(corners):2d}  px=({x / disp_scale:.0f}, {y / disp_scale:.0f})")
     redraw()
 
-    if len(clicks) == len(POINTS):
-        save_and_quit()
+
+# ── GPS input ─────────────────────────────────────────────────────────────────
+
+def parse_gps(raw: str):
+    """Return (lat, lon) floats or None."""
+    nums = re.findall(r"\d+\.\d+", raw)
+    if len(nums) >= 2:
+        return float(nums[0]), float(nums[1])
+    return None
 
 
-def save_and_quit() -> None:
-    with open(CALIB_FILE, "w") as f:
-        json.dump(clicks, f, indent=2)
-    print(f"\nSaved → {CALIB_FILE}")
-    for c in clicks:
-        print(f"  {c['label']}")
-        print(f"    GPS  N:{c['lat']}  W:{c['lon']}")
-        print(f"    Pixel ({c['px']}, {c['py']})")
-    cv2.waitKey(1200)
-    cv2.destroyAllWindows()
-    sys.exit(0)
-
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global img_orig
+    global img_orig, img_disp, disp_scale, phase
 
     img = cv2.imread(MAP_PATH)
     if img is None:
-        sys.exit(f"Cannot open {MAP_PATH} — run from D:\\trackproj\\")
+        sys.exit(f"Cannot open {MAP_PATH!r} — run from D:\\trackproj\\")
 
-    # Scale down if the image is enormous
+    img_orig = img
     h, w = img.shape[:2]
-    max_px = 1100
-    if max(h, w) > max_px:
-        s = max_px / max(h, w)
-        img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
-
-    img_orig = img.copy()
+    max_side = 1100
+    disp_scale = min(max_side / w, max_side / h)
+    img_disp = cv2.resize(img, (int(w * disp_scale), int(h * disp_scale)),
+                          interpolation=cv2.INTER_AREA)
 
     print(__doc__)
-    print("Points to click:")
-    for i, p in enumerate(POINTS):
-        print(f"  {i + 1}. {p['label']}")
-    print()
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(WIN, on_mouse)
     redraw()
 
-    while True:
+    # ── Phase 1: clicking ────────────────────────────────────────────────────
+    while phase == 1:
         key = cv2.waitKey(50) & 0xFF
-        if key == 27:           # ESC
-            print("Aborted — nothing saved.")
-            break
-        if key == ord("z") and clicks:
-            removed = clicks.pop()
-            print(f"  Undo: removed point at ({removed['px']}, {removed['py']})")
+        if key == ord("z") and corners:
+            corners.pop()
+            print(f"  undo → {len(corners)} corners")
             redraw()
+        elif key == ord("d"):
+            if len(corners) < 3:
+                print("  need at least 3 corners — keep clicking")
+            else:
+                phase = 2
+        elif key == 27:
+            print("Aborted.")
+            cv2.destroyAllWindows()
+            sys.exit(0)
+
+    print(f"\n{len(corners)} corners locked.\n")
+
+    # ── Phase 2: GPS input ────────────────────────────────────────────────────
+    print("Phase 2 — type the GPS coordinate shown on your dash cam")
+    print("when you passed each corner.  Format: 39.54075 122.33146\n")
+
+    for i, c in enumerate(corners):
+        redraw(highlight=i)
+        cv2.waitKey(1)
+
+        while True:
+            try:
+                raw = input(f"  Corner {i + 1:2d} lat lon › ").strip()
+            except EOFError:
+                break
+            result = parse_gps(raw)
+            if result:
+                c["lat"], c["lon"] = result
+                print(f"            → N:{c['lat']}  W:{c['lon']}")
+                break
+            print("    couldn't parse — try: 39.54075 122.33146")
 
     cv2.destroyAllWindows()
+
+    # Save
+    out = [
+        {"px_orig": c["px_orig"], "py_orig": c["py_orig"],
+         "lat": c["lat"], "lon": c["lon"]}
+        for c in corners
+    ]
+    with open(CALIB_FILE, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\nSaved {len(out)} corners → {CALIB_FILE}")
+    print("Run:  py generate_minimap.py --map TH.png")
 
 
 if __name__ == "__main__":
