@@ -3,37 +3,31 @@
 GPS Mini-Map Overlay Generator
 Thunderhill Raceway - May 29 2026
 
-GPS cleaning philosophy
------------------------
-Remove outliers hard -- no data is better than bad data.
-  Pass 1  Drop any reading that implies >280 km/h from the previous one.
-  Pass 2  Drop any reading whose arc position goes backward by >20 m.
+Pipeline
+--------
+1. Parse raw GPS from all log files.
+2. Clean: remove teleports (>280 km/h) and backward motion (>20 m reverse).
+   Gaps left by removed readings are handled automatically -- the interpolator
+   bridges across them, faking smooth forward motion between the surrounding
+   good readings.
+3. Extract one reference lap (first ~1 track-length of clean readings).
+   Building the track polyline from a single loop avoids the multi-lap
+   snap ambiguity that caused the dot to jump.
+4. Render: GpsTimeline interpolates lat/lon across the full session (including
+   any gaps), AffineMapper converts to canvas pixels, TrackSnapper projects
+   onto the single-loop polyline.  The dot cannot leave the track or reverse.
 
-Gap filling
------------
-Missing chunks are bridged by interpolating the arc-length position
-(how far around the track the car is) between the last good reading
-and the next good reading.  The dot moves smoothly along the track
-through any gap rather than teleporting or jumping.
-
-Dot
----
-Always snapped to the nearest segment of the GPS-driven track polyline.
-Cannot leave the track, cannot go backward, cannot teleport.
-
-Workflow:
-  1. py calibrate.py
-  2. py generate_minimap.py --map TH.png
+Saves GPS_clean.txt beside the GPS folder every run.
 
 Options:
-  --gps-folder PATH   GPS log folder            [TH-May-29-2026/GPS]
-  --output     PATH   Output video              [TH-May-29-2026/minimap_overlay.mp4]
-  --map        PATH   Track diagram PNG         [required]
-  --calib      PATH   Calibration JSON          [calibration.json]
-  --size       N      Canvas size px (square)   [500]
-  --fps        N      Frame rate                [30]
-  --smooth     N      GPS noise smoothing wnd   [5]
-  --bg         black|magenta                    [black]
+  --gps-folder PATH   [TH-May-29-2026/GPS]
+  --output     PATH   [TH-May-29-2026/minimap_overlay.mp4]
+  --map        PATH   track diagram PNG (required)
+  --calib      PATH   [calibration.json]
+  --size       N      canvas size px square  [500]
+  --fps        N      [30]
+  --smooth     N      GPS noise smoothing    [5]
+  --bg         black|magenta                 [black]
 """
 
 import os
@@ -52,8 +46,7 @@ import cv2
 # ---------------------------------------------------------------------------
 
 _GPS_RE = re.compile(
-    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s+"
-    r"N:([\d.]+)\s+W:([\d.]+)"
+    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s+N:([\d.]+)\s+W:([\d.]+)"
 )
 
 
@@ -67,6 +60,7 @@ def _dedup(rows):
 
 
 def parse_gps_folder(folder: str) -> list:
+    """Read every *.txt in folder. Lon stored as negative (standard sign)."""
     rows = []
     for path in sorted(glob.glob(os.path.join(folder, "*.txt"))):
         with open(path) as fh:
@@ -83,38 +77,35 @@ def parse_gps_folder(folder: str) -> list:
 # GPS cleaning
 # ---------------------------------------------------------------------------
 
-def _build_corner_arc(corners, cos_lat, R=111_111.0):
-    """Corner polyline in GPS metric space. Returns (E, N, arc, total_arc)."""
+def _corner_arc(corners, cos_lat, R=111_111.0):
+    """Closed polyline through calibration corners. Returns (E, N, arc, total)."""
     n = len(corners)
     E = np.array([c["lon"] * cos_lat * R for c in corners])
     N = np.array([c["lat"]               * R for c in corners])
     arc = np.zeros(n)
     for i in range(1, n):
         arc[i] = arc[i - 1] + np.hypot(E[i] - E[i - 1], N[i] - N[i - 1])
-    total_arc = arc[-1] + np.hypot(E[0] - E[-1], N[0] - N[-1])
-    return E, N, arc, total_arc
+    total = arc[-1] + np.hypot(E[0] - E[-1], N[0] - N[-1])
+    return E, N, arc, total
 
 
-def _project_arc(lat, lon, E, N, arc, total_arc, cos_lat, R=111_111.0):
-    """Arc-length position (metres) of GPS point projected onto corner polyline."""
-    pe = lon * cos_lat * R
-    pn = lat             * R
-    n  = len(E)
-    best_d2 = np.inf
-    best_arc = 0.0
+def _project_arc(lat, lon, E, N, arc, total, cos_lat, R=111_111.0):
+    """Arc-length position (m) of GPS point projected onto corner polyline."""
+    pe, pn = lon * cos_lat * R, lat * R
+    n = len(E)
+    best_d2, best_arc = np.inf, 0.0
     for i in range(n):
         j     = (i + 1) % n
-        arc_i = arc[i]
-        arc_j = arc[j] if j > 0 else total_arc
-        dae = E[j] - E[i]; dan = N[j] - N[i]
+        arc_j = arc[j] if j > 0 else total
+        dae, dan = E[j] - E[i], N[j] - N[i]
         len2 = dae * dae + dan * dan
         t = 0.0 if len2 < 1e-6 else max(0.0, min(1.0,
             ((pe - E[i]) * dae + (pn - N[i]) * dan) / len2))
-        ne = E[i] + t * dae; nn = N[i] + t * dan
+        ne, nn = E[i] + t * dae, N[i] + t * dan
         d2 = (pe - ne) ** 2 + (pn - nn) ** 2
         if d2 < best_d2:
-            best_d2 = d2
-            best_arc = arc_i + t * (arc_j - arc_i)
+            best_d2  = d2
+            best_arc = arc[i] + t * (arc_j - arc[i])
     return best_arc
 
 
@@ -122,28 +113,23 @@ def clean_gps(raw: list, corners: list, clean_path: str,
               max_speed_kmh: float = 280.0,
               backward_tol_m: float = 20.0) -> list:
     """
-    Aggressively remove outliers.  No data is better than bad data.
+    Remove outliers hard.  No data > bad data.
+    Gaps are bridged later by GpsTimeline interpolation.
 
-    Pass 1 - Teleport: drop if implied speed from previous reading > max_speed_kmh.
-    Pass 2 - Forward-only: project onto corner arc; drop if going backward
-             by more than backward_tol_m.  Lap wrap-around allowed.
-
-    Gaps left by removed readings are bridged in TrackTimeline by arc
-    interpolation -- the dot fakes smooth motion between the surrounding
-    good positions.
+    Pass 1: drop teleports  (implied speed > max_speed_kmh)
+    Pass 2: drop backward   (arc goes > backward_tol_m in reverse)
     """
     mean_lat = np.mean([c["lat"] for c in corners])
     cos_lat  = np.cos(np.radians(mean_lat))
     R        = 111_111.0
     max_ms   = max_speed_kmh / 3.6
-    E, N, arc_pts, total_arc = _build_corner_arc(corners, cos_lat, R)
+    E, N, arc_pts, total = _corner_arc(corners, cos_lat, R)
 
-    # Pass 1: teleport removal
-    p1 = [raw[0]]
-    n_tp = 0
+    # Pass 1 — teleport
+    p1, n_tp = [raw[0]], 0
     for curr in raw[1:]:
         prev = p1[-1]
-        dt   = (curr[0] - prev[0]).total_seconds()
+        dt = (curr[0] - prev[0]).total_seconds()
         if dt <= 0:
             n_tp += 1; continue
         de = (curr[2] - prev[2]) * cos_lat * R
@@ -153,37 +139,95 @@ def clean_gps(raw: list, corners: list, clean_path: str,
         else:
             n_tp += 1
 
-    # Pass 2: forward-only
-    p2       = [p1[0]]
-    prev_arc = _project_arc(p1[0][1], p1[0][2], E, N, arc_pts, total_arc, cos_lat, R)
-    n_bk     = 0
+    # Pass 2 — forward-only
+    p2, n_bk = [p1[0]], 0
+    prev_a = _project_arc(p1[0][1], p1[0][2], E, N, arc_pts, total, cos_lat, R)
     for p in p1[1:]:
-        a          = _project_arc(p[1], p[2], E, N, arc_pts, total_arc, cos_lat, R)
-        lap_done   = (prev_arc > total_arc * 0.75) and (a < total_arc * 0.25)
-        if lap_done or a >= prev_arc - backward_tol_m:
-            p2.append(p)
-            prev_arc = a
+        a        = _project_arc(p[1], p[2], E, N, arc_pts, total, cos_lat, R)
+        lap_done = (prev_a > total * 0.75) and (a < total * 0.25)
+        if lap_done or a >= prev_a - backward_tol_m:
+            p2.append(p); prev_a = a
         else:
             n_bk += 1
 
-    # Save clean file
-    parent = os.path.dirname(clean_path)
-    if parent:
+    # Save
+    if (parent := os.path.dirname(clean_path)):
         os.makedirs(parent, exist_ok=True)
     with open(clean_path, "w") as f:
         for p in p2:
-            ts = p[0].strftime("%Y/%m/%d %H:%M:%S")
-            f.write(f"{ts} N:{p[1]:.6f} W:{-p[2]:.6f}\n")
+            f.write(f"{p[0].strftime('%Y/%m/%d %H:%M:%S')} "
+                    f"N:{p[1]:.6f} W:{-p[2]:.6f}\n")
 
     print(f"  Teleports removed : {n_tp}")
     print(f"  Backward removed  : {n_bk}")
-    print(f"  Kept              : {len(p2):,} / {len(raw):,} readings")
-    print(f"  Clean GPS saved   : {clean_path}")
+    print(f"  Kept : {len(p2):,} / {len(raw):,}  |  GPS_clean.txt saved")
     return p2
 
 
 # ---------------------------------------------------------------------------
-# AffineMapper  (GPS -> canvas pixel via least-squares over calibration corners)
+# Reference lap  (single-loop track polyline, avoids multi-lap snap issue)
+# ---------------------------------------------------------------------------
+
+def extract_reference_lap(clean: list, approx_length_m: float,
+                           cos_lat: float, R: float = 111_111.0) -> list:
+    """
+    Walk clean GPS readings from the start until we have covered
+    approximately one lap's worth of cumulative distance.
+
+    Why: building TrackSnapper from all laps creates an N-loop polyline.
+    Snapping to it is ambiguous -- the same physical location appears N
+    times and the nearest-segment search can pick any of them, causing
+    the dot to jump wildly.  A single-loop polyline has each track location
+    exactly once, so snapping is always unambiguous.
+    """
+    dist, lap = 0.0, [clean[0]]
+    for i in range(1, len(clean)):
+        prev, curr = clean[i - 1], clean[i]
+        de = (curr[2] - prev[2]) * cos_lat * R
+        dn = (curr[1] - prev[1]) * R
+        dist += np.hypot(de, dn)
+        lap.append(curr)
+        if dist >= approx_length_m:
+            break
+    print(f"  Reference lap : {len(lap)} pts, "
+          f"{dist:.0f} m GPS distance  (track ~{approx_length_m:.0f} m)")
+    return lap
+
+
+# ---------------------------------------------------------------------------
+# GPS timeline  (interpolates lat/lon across whole session; bridges gaps)
+# ---------------------------------------------------------------------------
+
+class GpsTimeline:
+    """
+    Binary-search interpolation over all clean GPS readings.
+
+    When outliers were removed, consecutive timestamps have a larger gap.
+    GpsTimeline.at(t) interpolates lat/lon linearly between the surrounding
+    good readings, effectively faking smooth motion through any hole.
+    """
+
+    def __init__(self, points: list):
+        self.t0       = points[0][0]
+        self.duration = (points[-1][0] - self.t0).total_seconds()
+        self._times   = np.array([(p[0] - self.t0).total_seconds() for p in points])
+        self._lats    = np.array([p[1] for p in points])
+        self._lons    = np.array([p[2] for p in points])
+
+    def at(self, t_sec: float):
+        t_sec = float(np.clip(t_sec, 0.0, self.duration))
+        idx   = int(np.searchsorted(self._times, t_sec, side="right")) - 1
+        idx   = max(0, min(idx, len(self._times) - 2))
+        t0, t1 = self._times[idx], self._times[idx + 1]
+        a = (t_sec - t0) / (t1 - t0) if t1 > t0 else 0.0
+        return (
+            float(self._lats[idx] + a * (self._lats[idx + 1] - self._lats[idx])),
+            float(self._lons[idx] + a * (self._lons[idx + 1] - self._lons[idx])),
+        )
+
+
+# ---------------------------------------------------------------------------
+# AffineMapper  (GPS -> canvas pixel via least-squares over all calib corners)
 # ---------------------------------------------------------------------------
 
 class AffineMapper:
@@ -205,22 +249,19 @@ class AffineMapper:
 
 
 # ---------------------------------------------------------------------------
-# TrackSnapper  (pixel polyline from GPS session + arc-aware snapping)
+# TrackSnapper  (single-loop pixel polyline; nearest-segment projection)
 # ---------------------------------------------------------------------------
 
 class TrackSnapper:
     """
-    Builds a pixel polyline from the cleaned GPS session (via AffineMapper),
-    smooths it, then snaps positions to it.
-
-    Also maintains a cumulative arc-length array so callers can:
-      snap_with_arc(px, py)  -> (snapped_px, snapped_py, arc_metres)
-      at_arc(arc)            -> (px, py)  -- position at given arc length
+    Built from ONE reference lap so the polyline is a single closed loop.
+    Every physical track location appears exactly once -- snapping is
+    always unambiguous regardless of which lap the car is currently on.
     """
 
-    def __init__(self, gps_points: list, mapper: AffineMapper, smooth: int = 5):
-        px = np.array([mapper(p[1], p[2])[0] for p in gps_points])
-        py = np.array([mapper(p[1], p[2])[1] for p in gps_points])
+    def __init__(self, ref_lap: list, mapper: AffineMapper, smooth: int = 5):
+        px = np.array([mapper(p[1], p[2])[0] for p in ref_lap])
+        py = np.array([mapper(p[1], p[2])[1] for p in ref_lap])
         if smooth > 1:
             k  = np.ones(smooth) / smooth
             px = np.convolve(px, k, mode="same")
@@ -228,20 +269,9 @@ class TrackSnapper:
         self._px = px
         self._py = py
         self._n  = len(px)
+        print(f"  Track polyline : {self._n} points (single lap)")
 
-        # Cumulative arc lengths along the pixel polyline
-        diffs        = np.hypot(np.diff(px), np.diff(py))
-        self._arc    = np.zeros(self._n)
-        self._arc[1:] = np.cumsum(diffs)
-        self.total_arc = float(self._arc[-1])
-
-        print(f"  Track polyline : {self._n} points, "
-              f"total arc = {self.total_arc:.0f} px")
-
-    # -- internal nearest-segment search ------------------------------------
-
-    def _find_segment(self, raw_px: float, raw_py: float):
-        """Returns (best_x, best_y, arc) of the snapped point."""
+    def __call__(self, raw_px: float, raw_py: float) -> tuple:
         dx    = self._px - raw_px
         dy    = self._py - raw_py
         dist2 = dx * dx + dy * dy
@@ -251,7 +281,6 @@ class TrackSnapper:
         best_d2 = np.inf
         best_x  = self._px[0]
         best_y  = self._py[0]
-        best_arc = 0.0
 
         for idx in cands:
             for j in (int(idx) - 1, int(idx)):
@@ -259,108 +288,24 @@ class TrackSnapper:
                     continue
                 ax, ay  = self._px[j],     self._py[j]
                 bx, by  = self._px[j + 1], self._py[j + 1]
-                dab_x   = bx - ax
-                dab_y   = by - ay
+                dab_x, dab_y = bx - ax, by - ay
                 len2    = dab_x * dab_x + dab_y * dab_y
                 if len2 < 0.1:
                     continue
-                t = ((raw_px - ax) * dab_x + (raw_py - ay) * dab_y) / len2
-                t = max(0.0, min(1.0, t))
-                nx  = ax + t * dab_x
-                ny  = ay + t * dab_y
-                d2  = (raw_px - nx) ** 2 + (raw_py - ny) ** 2
+                t  = ((raw_px - ax) * dab_x + (raw_py - ay) * dab_y) / len2
+                t  = max(0.0, min(1.0, t))
+                nx = ax + t * dab_x
+                ny = ay + t * dab_y
+                d2 = (raw_px - nx) ** 2 + (raw_py - ny) ** 2
                 if d2 < best_d2:
-                    best_d2  = d2
+                    best_d2 = d2
                     best_x, best_y = nx, ny
-                    best_arc = self._arc[j] + t * (self._arc[j + 1] - self._arc[j])
 
-        return best_x, best_y, best_arc
-
-    # -- public API ---------------------------------------------------------
-
-    def __call__(self, raw_px: float, raw_py: float) -> tuple:
-        x, y, _ = self._find_segment(raw_px, raw_py)
-        return int(round(x)), int(round(y))
-
-    def snap_with_arc(self, raw_px: float, raw_py: float) -> tuple:
-        """Returns (px, py, arc) -- snapped pixel + arc length along polyline."""
-        x, y, arc = self._find_segment(raw_px, raw_py)
-        return int(round(x)), int(round(y)), arc
-
-    def at_arc(self, arc_target: float) -> tuple:
-        """
-        Pixel position at arc_target along the track.
-        Handles cumulative (multi-lap) arc values by wrapping with modulo.
-        """
-        arc_mod = arc_target % self.total_arc
-        idx = int(np.searchsorted(self._arc, arc_mod, side="right")) - 1
-        idx = max(0, min(idx, self._n - 2))
-        span = self._arc[idx + 1] - self._arc[idx]
-        t    = (arc_mod - self._arc[idx]) / span if span > 1e-6 else 0.0
-        t    = max(0.0, min(1.0, t))
-        x    = self._px[idx] + t * (self._px[idx + 1] - self._px[idx])
-        y    = self._py[idx] + t * (self._py[idx + 1] - self._py[idx])
-        return int(round(x)), int(round(y))
+        return int(round(best_x)), int(round(best_y))
 
 
 # ---------------------------------------------------------------------------
-# TrackTimeline  (time -> pixel, with gap-bridging via arc interpolation)
-# ---------------------------------------------------------------------------
-
-class TrackTimeline:
-    """
-    Maps session time -> pixel position.
-
-    Each clean GPS reading is projected onto the track to get an arc-length
-    position.  Between readings (including across large gaps from removed
-    outliers) the arc position is linearly interpolated and resolved to a
-    pixel via TrackSnapper.at_arc().
-
-    The dot always moves forward along the track, even through data gaps.
-    """
-
-    def __init__(self, clean_points: list, mapper: AffineMapper,
-                 snapper: TrackSnapper):
-        self.t0       = clean_points[0][0]
-        self.duration = (clean_points[-1][0] - self.t0).total_seconds()
-
-        # Per-reading: time and snapped arc position
-        times = []
-        arcs  = []
-        for p in clean_points:
-            rpx, rpy = mapper(p[1], p[2])
-            _, _, arc = snapper.snap_with_arc(rpx, rpy)
-            times.append((p[0] - self.t0).total_seconds())
-            arcs.append(arc)
-
-        # Make arcs monotonically increasing across lap boundaries
-        arcs = np.array(arcs, dtype=float)
-        total = snapper.total_arc
-        for i in range(1, len(arcs)):
-            # Lap completion: arc dropped from near end back to near start
-            if arcs[i] < arcs[i - 1] - total * 0.5:
-                arcs[i:] += total
-
-        self._times   = np.array(times)
-        self._arcs    = arcs
-        self._snapper = snapper
-
-    def at(self, t_sec: float) -> tuple:
-        """Returns pixel (x, y) for the given session time (seconds from start)."""
-        t_sec = float(np.clip(t_sec, 0, self.duration))
-        idx   = int(np.searchsorted(self._times, t_sec, side="right")) - 1
-        idx   = max(0, min(idx, len(self._times) - 2))
-
-        t0, t1     = self._times[idx], self._times[idx + 1]
-        arc0, arc1 = self._arcs[idx],  self._arcs[idx + 1]
-
-        a    = (t_sec - t0) / (t1 - t0) if t1 > t0 else 0.0
-        arc  = arc0 + a * (arc1 - arc0)
-        return self._snapper.at_arc(arc)
-
-
-# ---------------------------------------------------------------------------
-# Canvas builder
+# Canvas
 # ---------------------------------------------------------------------------
 
 def build_canvas(map_path: str, calib_path: str,
@@ -397,7 +342,7 @@ def build_canvas(map_path: str, calib_path: str,
 
 
 # ---------------------------------------------------------------------------
-# Frame drawing
+# Frame
 # ---------------------------------------------------------------------------
 
 def draw_frame(base: np.ndarray, pos: tuple) -> np.ndarray:
@@ -411,38 +356,48 @@ def draw_frame(base: np.ndarray, pos: tuple) -> np.ndarray:
 # Render
 # ---------------------------------------------------------------------------
 
-def render(raw_points: list, args) -> None:
+def render(raw: list, args) -> None:
     bg_color = (0, 0, 0) if args.bg == "black" else (255, 0, 255)
 
     print("Building canvas...")
     canvas, mapper, raw_corners = build_canvas(
         args.map, args.calib, args.size, bg_color)
 
-    # Clean GPS -- always regenerated
     gps_parent = os.path.dirname(os.path.normpath(args.gps_folder))
     clean_path = os.path.join(gps_parent, "GPS_clean.txt")
-    print("Cleaning GPS data...")
-    clean = clean_gps(raw_points, raw_corners, clean_path)
+    print("Cleaning GPS...")
+    clean = clean_gps(raw, raw_corners, clean_path)
 
-    print("Building track polyline...")
-    snapper  = TrackSnapper(clean, mapper, smooth=args.smooth)
+    # Approximate track length from calibration corners
+    mean_lat = np.mean([c["lat"] for c in raw_corners])
+    cos_lat  = np.cos(np.radians(mean_lat))
+    R        = 111_111.0
+    _, _, _, track_len_m = _corner_arc(raw_corners, cos_lat, R)
 
-    print("Building track timeline (arc interpolation)...")
-    timeline = TrackTimeline(clean, mapper, snapper)
+    print("Extracting reference lap for track shape...")
+    ref_lap = extract_reference_lap(clean, track_len_m, cos_lat, R)
 
+    print("Building track snapper...")
+    snapper  = TrackSnapper(ref_lap, mapper, smooth=args.smooth)
+
+    # Full session timeline (GpsTimeline bridges gaps via lat/lon interpolation)
+    timeline     = GpsTimeline(clean)
     total_frames = int(timeline.duration * args.fps)
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.output, fourcc, args.fps,
                              (args.size, args.size))
     if not writer.isOpened():
-        raise RuntimeError(f"Cannot open output: {args.output}")
+        raise RuntimeError(f"Cannot write: {args.output}")
 
-    print(f"  Duration : {timeline.duration / 60:.1f} min")
-    print(f"  Frames   : {total_frames:,} @ {args.fps} fps")
-    print(f"  Output   : {args.output}")
+    print(f"  {timeline.duration / 60:.1f} min  |  "
+          f"{total_frames:,} frames @ {args.fps} fps")
+    print(f"  Output: {args.output}")
 
     for fi in range(total_frames):
-        pos = timeline.at(fi / args.fps)
+        lat, lon       = timeline.at(fi / args.fps)
+        raw_px, raw_py = mapper(lat, lon)
+        pos            = snapper(raw_px, raw_py)
         writer.write(draw_frame(canvas, pos))
         if fi % (args.fps * 30) == 0:
             print(f"  [{100 * fi / total_frames:5.1f}%]  "
@@ -458,7 +413,7 @@ def render(raw_points: list, args) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="GPS mini-map -- clean, forward-only, gap-bridging",
+        description="GPS mini-map: clean GPS, single-lap snap, gap-bridging",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--gps-folder", default=r"TH-May-29-2026\GPS")
