@@ -305,6 +305,65 @@ class TrackSnapper:
 
 
 # ---------------------------------------------------------------------------
+# Image-pixel snap  (BFS Voronoi -- dot lands exactly on the drawn line)
+# ---------------------------------------------------------------------------
+
+def _build_image_snap(img_bgr: np.ndarray, sw: int, sh: int,
+                      off_x: int, off_y: int, canvas_size: int) -> tuple:
+    """
+    Build a nearest-track-pixel lookup table for every canvas pixel.
+
+    Algorithm: BFS outward from each track-line pixel.  Each non-track
+    pixel inherits the coordinates of the nearest track pixel it was
+    reached from.  O(canvas_size^2) -- runs once at startup.
+
+    In TH.png the track lines are BLACK on a WHITE background.
+    We threshold the original (non-inverted) image at gray < 100.
+
+    Returns (nearest_x, nearest_y) arrays of shape (canvas_size, canvas_size).
+    Pixels with no track pixel in the image have value -1 (use GPS pos as fallback).
+    """
+    from collections import deque
+
+    gray = cv2.cvtColor(
+        cv2.resize(img_bgr, (sw, sh), interpolation=cv2.INTER_AREA),
+        cv2.COLOR_BGR2GRAY,
+    )
+    track_mask = gray < 100   # True where track line drawn
+
+    H = W = canvas_size
+    nx = np.full((H, W), -1, dtype=np.int16)
+    ny = np.full((H, W), -1, dtype=np.int16)
+    vis = np.zeros((H, W), dtype=bool)
+
+    q = deque()
+    ys, xs = np.where(track_mask)
+    for iy, ix in zip(ys.tolist(), xs.tolist()):
+        cx, cy = ix + off_x, iy + off_y
+        if 0 <= cx < W and 0 <= cy < H and not vis[cy, cx]:
+            nx[cy, cx] = cx
+            ny[cy, cx] = cy
+            vis[cy, cx] = True
+            q.append((cy, cx))
+
+    DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+    while q:
+        y, x = q.popleft()
+        for dy, dx in DIRS:
+            yy, xx = y + dy, x + dx
+            if 0 <= yy < H and 0 <= xx < W and not vis[yy, xx]:
+                vis[yy, xx] = True
+                nx[yy, xx] = nx[y, x]
+                ny[yy, xx] = ny[y, x]
+                q.append((yy, xx))
+
+    n_track = int(vis.sum())   # all pixels got assigned (vis covers whole canvas after BFS)
+    print(f"  Image snap map : {n_track:,} pixels assigned  "
+          f"({int((track_mask > 0).sum()):,} track-line pixels in source)")
+    return nx, ny
+
+
+# ---------------------------------------------------------------------------
 # Canvas
 # ---------------------------------------------------------------------------
 
@@ -332,13 +391,16 @@ def build_canvas(map_path: str, calib_path: str,
         canvas[:] = bg_color
     canvas[off_y:off_y + sh, off_x:off_x + sw] = inv
 
+    print("  Building image snap map (BFS)...")
+    snap_x, snap_y = _build_image_snap(img, sw, sh, off_x, off_y, canvas_size)
+
     corners = [
         {"lat": c["lat"], "lon": c["lon"],
          "px": c["px_orig"] * scale + off_x,
          "py": c["py_orig"] * scale + off_y}
         for c in raw_corners
     ]
-    return canvas, AffineMapper(corners), raw_corners
+    return canvas, AffineMapper(corners), raw_corners, snap_x, snap_y
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +422,7 @@ def render(raw: list, args) -> None:
     bg_color = (0, 0, 0) if args.bg == "black" else (255, 0, 255)
 
     print("Building canvas...")
-    canvas, mapper, raw_corners = build_canvas(
+    canvas, mapper, raw_corners, snap_x, snap_y = build_canvas(
         args.map, args.calib, args.size, bg_color)
 
     gps_parent = os.path.dirname(os.path.normpath(args.gps_folder))
@@ -394,10 +456,20 @@ def render(raw: list, args) -> None:
           f"{total_frames:,} frames @ {args.fps} fps")
     print(f"  Output: {args.output}")
 
+    S = args.size - 1   # clamp bound
     for fi in range(total_frames):
         lat, lon       = timeline.at(fi / args.fps)
         raw_px, raw_py = mapper(lat, lon)
-        pos            = snapper(raw_px, raw_py)
+
+        # Step 1: GPS polyline snap -- correct direction / lap ordering
+        gx, gy = snapper(raw_px, raw_py)
+
+        # Step 2: image pixel snap -- land exactly on the drawn track line
+        cx = int(max(0, min(S, gx)))
+        cy = int(max(0, min(S, gy)))
+        ix, iy = int(snap_x[cy, cx]), int(snap_y[cy, cx])
+        pos = (ix, iy) if ix >= 0 else (gx, gy)
+
         writer.write(draw_frame(canvas, pos))
         if fi % (args.fps * 30) == 0:
             print(f"  [{100 * fi / total_frames:5.1f}%]  "
