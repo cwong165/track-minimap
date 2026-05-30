@@ -62,7 +62,14 @@ def get_clipboard() -> str:
 
 def parse_coords(text: str) -> list:
     pat = re.compile(r"(-?\d{2,3}\.\d+)\s*,\s*(-?\d{2,3}\.\d+)")
-    return [(float(m.group(1)), float(m.group(2))) for m in pat.finditer(text)]
+    out = []
+    for m in pat.finditer(text):
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        if lon > 0:
+            lon = -lon   # W:122.33 style (no minus) → standard -122.33
+        out.append((lat, lon))
+    return out
 
 
 def label_bg(canvas, text, x, y, font, scale, col, thick):
