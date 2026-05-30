@@ -20,6 +20,7 @@ Run from D:\\trackproj\\
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -129,7 +130,7 @@ def build_frame() -> np.ndarray:
     n_matched = len(coords)
     ok = n_matched >= n_corners > 0
     s_col = (60, 240, 120) if ok else (40, 180, 255)
-    s_text = (f"Ctrl+V = paste GPS block  |  Z = undo  |  D = save   "
+    s_text = (f"Ctrl+V = paste  |  C = clear paste  |  Z = undo corner  |  D = save   "
               f"[{n_matched} / {n_corners} matched]")
     cv2.putText(canvas, s_text, (8, py0 + 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, s_col, 1, cv2.LINE_AA)
@@ -179,6 +180,13 @@ def on_mouse(event, x, y, _flags, _param) -> None:
 def main() -> None:
     global map_img, disp_scale, map_w, map_h, text_buffer, coords
 
+    # Skip if calibration already exists
+    if os.path.isfile(CALIB_FILE):
+        print(f"\n{CALIB_FILE} already exists.")
+        print("Delete it and re-run calibrate.py if you want to redo it.")
+        print("Otherwise run:  py generate_minimap.py --map TH.png")
+        sys.exit(0)
+
     img = cv2.imread(MAP_PATH)
     if img is None:
         sys.exit(f"Cannot open {MAP_PATH!r} — run from D:\\trackproj\\")
@@ -202,7 +210,12 @@ def main() -> None:
         if key == 22:                        # Ctrl+V
             text_buffer = get_clipboard()
             coords = parse_coords(text_buffer)
-            print(f"  Pasted → {len(coords)} GPS coordinates parsed")
+            print(f"  Pasted -> {len(coords)} GPS coordinates parsed")
+
+        elif key == ord("c"):                # clear pasted text
+            text_buffer = ""
+            coords = []
+            print("  Cleared pasted coordinates")
 
         elif key == ord("z") and corners:    # undo
             corners.pop()

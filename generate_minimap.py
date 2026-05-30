@@ -31,7 +31,6 @@ Options:
   --calib      PATH   Calibration JSON          [calibration.json]
   --size       N      Canvas size px (square)   [500]
   --fps        N      Frame rate                [30]
-  --trail      N      Trail length, seconds     [2.0]
   --smooth     N      GPS noise smoothing wnd   [5]
   --bg         black|magenta                    [black]
 """
@@ -259,14 +258,8 @@ def build_canvas(map_path: str, calib_path: str,
 # Frame drawing
 # ---------------------------------------------------------------------------
 
-def draw_frame(base: np.ndarray, trail: list, pos: tuple) -> np.ndarray:
+def draw_frame(base: np.ndarray, pos: tuple) -> np.ndarray:
     frame = base.copy()
-    n = len(trail)
-    for j in range(n - 1):
-        a = (j + 1) / n
-        cv2.line(frame, trail[j], trail[j + 1],
-                 (0, 0, int(60 + 140 * a)),
-                 max(1, int(4 * a)), cv2.LINE_AA)
     cv2.circle(frame, pos, 8, (0,   0, 255), -1, cv2.LINE_AA)
     cv2.circle(frame, pos, 8, (255, 255, 255),  1, cv2.LINE_AA)
     return frame
@@ -287,7 +280,6 @@ def render(gps_points: list, args) -> None:
 
     timeline     = GpsTimeline(gps_points)
     total_frames = int(timeline.duration * args.fps)
-    trail_max    = int(args.trail * args.fps)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.output, fourcc, args.fps,
@@ -300,17 +292,12 @@ def render(gps_points: list, args) -> None:
           f"{total_frames:,} frames @ {args.fps} fps")
     print(f"  Output: {args.output}")
 
-    trail: list = []
     for fi in range(total_frames):
         lat, lon = timeline.at(fi / args.fps)
         raw_px, raw_py = mapper(lat, lon)
         pos = snapper(raw_px, raw_py)
 
-        trail.append(pos)
-        if len(trail) > trail_max:
-            trail.pop(0)
-
-        writer.write(draw_frame(canvas, trail, pos))
+        writer.write(draw_frame(canvas, pos))
 
         if fi % (args.fps * 30) == 0:
             print(f"  [{100 * fi / total_frames:5.1f}%]  "
@@ -335,7 +322,6 @@ def main() -> None:
     p.add_argument("--calib",      default="calibration.json")
     p.add_argument("--size",       type=int,   default=500)
     p.add_argument("--fps",        type=int,   default=30)
-    p.add_argument("--trail",      type=float, default=2.0)
     p.add_argument("--smooth",     type=int,   default=5,
                    help="GPS noise smoothing window (readings). "
                         "Higher = smoother but slightly less responsive.")
