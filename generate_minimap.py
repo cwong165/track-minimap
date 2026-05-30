@@ -291,10 +291,17 @@ class TrackSnapper:
         self._py = py
         self._n  = len(px)
         self._cursor = 0.0   # cumulative segment position, increases across laps
-        print(f"  Track polyline : {self._n} points (single lap)")
 
-    def snap_forward(self, raw_px: float, raw_py: float,
-                     max_advance: int = 200) -> tuple:
+        # Cap the forward search at 1/3 of the lap so the window never wraps
+        # around far enough to confuse T14 with T9-in-lap-2 or similar.
+        # Still covers any realistic GPS gap: n//3 segments × avg segment length
+        # >> longest plausible data gap at max track speed.
+        self._max_advance = max(30, self._n // 3)
+
+        print(f"  Track polyline : {self._n} points (single lap) "
+              f" max_advance={self._max_advance}")
+
+    def snap_forward(self, raw_px: float, raw_py: float) -> tuple:
         """
         Forward-only sequential snap.  Must be called in timestamp order.
 
@@ -302,11 +309,13 @@ class TrackSnapper:
         indexing so multi-lap sessions work naturally.  The tiny backward
         slack (-2) handles GPS noise near reading boundaries.
 
-        max_advance=200 comfortably covers any gap from outlier removal
-        at any track speed.
+        max_advance = n//3 so the window never wraps far enough to confuse
+        physically-separate corners that happen to be adjacent on the polyline
+        in a different lap (the T14/T9 problem).
         """
-        n   = self._n
-        cur = int(self._cursor)
+        n            = self._n
+        max_advance  = self._max_advance
+        cur          = int(self._cursor)
 
         best_d2  = np.inf
         best_cum = cur
