@@ -195,35 +195,52 @@ def extract_reference_lap(clean: list, approx_length_m: float,
 
 
 # ---------------------------------------------------------------------------
-# GPS timeline  (interpolates lat/lon across whole session; bridges gaps)
+# Pixel timeline  (pre-snaps every GPS reading; lerps pixel positions)
 # ---------------------------------------------------------------------------
 
-class GpsTimeline:
+class PixelTimeline:
     """
-    Binary-search interpolation over all clean GPS readings.
+    Converts every clean GPS reading to its final canvas pixel position once
+    (GPS snap + image pixel snap), then for each video frame returns a
+    linearly-interpolated pixel between the two surrounding readings.
 
-    When outliers were removed, consecutive timestamps have a larger gap.
-    GpsTimeline.at(t) interpolates lat/lon linearly between the surrounding
-    good readings, effectively faking smooth motion through any hole.
+    Pixel-to-pixel lerp gives guaranteed smooth, linear dot motion at any
+    frame rate regardless of GPS sample rate.  Gaps from removed outliers
+    are bridged automatically -- the dot glides in a straight pixel line
+    from the last good position to the next.
     """
 
-    def __init__(self, points: list):
+    def __init__(self, points: list, mapper, snapper,
+                 snap_x: np.ndarray, snap_y: np.ndarray, canvas_size: int):
         self.t0       = points[0][0]
         self.duration = (points[-1][0] - self.t0).total_seconds()
         self._times   = np.array([(p[0] - self.t0).total_seconds() for p in points])
-        self._lats    = np.array([p[1] for p in points])
-        self._lons    = np.array([p[2] for p in points])
 
-    def at(self, t_sec: float):
+        S = canvas_size - 1
+        px_list, py_list = [], []
+        for p in points:
+            rpx, rpy    = mapper(p[1], p[2])
+            gx, gy      = snapper(rpx, rpy)                 # GPS polyline snap
+            cx = int(max(0, min(S, gx)))
+            cy = int(max(0, min(S, gy)))
+            ix = int(snap_x[cy, cx])
+            iy = int(snap_y[cy, cx])
+            px_list.append(float(ix) if ix >= 0 else float(gx))
+            py_list.append(float(iy) if iy >= 0 else float(gy))
+
+        self._px = np.array(px_list)
+        self._py = np.array(py_list)
+        print(f"  Pixel timeline : {len(points):,} pre-snapped positions")
+
+    def at(self, t_sec: float) -> tuple:
         t_sec = float(np.clip(t_sec, 0.0, self.duration))
         idx   = int(np.searchsorted(self._times, t_sec, side="right")) - 1
         idx   = max(0, min(idx, len(self._times) - 2))
         t0, t1 = self._times[idx], self._times[idx + 1]
         a = (t_sec - t0) / (t1 - t0) if t1 > t0 else 0.0
-        return (
-            float(self._lats[idx] + a * (self._lats[idx + 1] - self._lats[idx])),
-            float(self._lons[idx] + a * (self._lons[idx + 1] - self._lons[idx])),
-        )
+        x = self._px[idx] + a * (self._px[idx + 1] - self._px[idx])
+        y = self._py[idx] + a * (self._py[idx + 1] - self._py[idx])
+        return int(round(x)), int(round(y))
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +457,10 @@ def render(raw: list, args) -> None:
     ref_lap = extract_reference_lap(clean, track_len_m, cos_lat, R)
 
     print("Building track snapper...")
-    snapper  = TrackSnapper(ref_lap, mapper, smooth=args.smooth)
+    snapper = TrackSnapper(ref_lap, mapper, smooth=args.smooth)
 
-    # Full session timeline (GpsTimeline bridges gaps via lat/lon interpolation)
-    timeline     = GpsTimeline(clean)
+    print("Pre-snapping GPS readings to pixel positions...")
+    timeline     = PixelTimeline(clean, mapper, snapper, snap_x, snap_y, args.size)
     total_frames = int(timeline.duration * args.fps)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -456,20 +473,8 @@ def render(raw: list, args) -> None:
           f"{total_frames:,} frames @ {args.fps} fps")
     print(f"  Output: {args.output}")
 
-    S = args.size - 1   # clamp bound
     for fi in range(total_frames):
-        lat, lon       = timeline.at(fi / args.fps)
-        raw_px, raw_py = mapper(lat, lon)
-
-        # Step 1: GPS polyline snap -- correct direction / lap ordering
-        gx, gy = snapper(raw_px, raw_py)
-
-        # Step 2: image pixel snap -- land exactly on the drawn track line
-        cx = int(max(0, min(S, gx)))
-        cy = int(max(0, min(S, gy)))
-        ix, iy = int(snap_x[cy, cx]), int(snap_y[cy, cx])
-        pos = (ix, iy) if ix >= 0 else (gx, gy)
-
+        pos = timeline.at(fi / args.fps)   # pre-snapped + pixel lerp
         writer.write(draw_frame(canvas, pos))
         if fi % (args.fps * 30) == 0:
             print(f"  [{100 * fi / total_frames:5.1f}%]  "
