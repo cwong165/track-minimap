@@ -220,7 +220,7 @@ class PixelTimeline:
         px_list, py_list = [], []
         for p in points:
             rpx, rpy    = mapper(p[1], p[2])
-            gx, gy      = snapper(rpx, rpy)                 # GPS polyline snap
+            gx, gy      = snapper.snap_forward(rpx, rpy)    # CCW forward-only snap
             cx = int(max(0, min(S, gx)))
             cy = int(max(0, min(S, gy)))
             ix = int(snap_x[cy, cx])
@@ -272,8 +272,12 @@ class AffineMapper:
 class TrackSnapper:
     """
     Built from ONE reference lap so the polyline is a single closed loop.
-    Every physical track location appears exactly once -- snapping is
-    always unambiguous regardless of which lap the car is currently on.
+    Every physical track location appears exactly once.
+
+    snap_forward() enforces counter-clockwise, forward-only motion by
+    keeping a rolling cursor and only searching a bounded window ahead of
+    it.  The car cannot jump to the wrong side of a tight hairpin because
+    reaching the other side would require going backward.
     """
 
     def __init__(self, ref_lap: list, mapper: AffineMapper, smooth: int = 5):
@@ -286,7 +290,55 @@ class TrackSnapper:
         self._px = px
         self._py = py
         self._n  = len(px)
+        self._cursor = 0.0   # cumulative segment position, increases across laps
         print(f"  Track polyline : {self._n} points (single lap)")
+
+    def snap_forward(self, raw_px: float, raw_py: float,
+                     max_advance: int = 200) -> tuple:
+        """
+        Forward-only sequential snap.  Must be called in timestamp order.
+
+        Searches segments [cursor-2 .. cursor+max_advance] using modular
+        indexing so multi-lap sessions work naturally.  The tiny backward
+        slack (-2) handles GPS noise near reading boundaries.
+
+        max_advance=200 comfortably covers any gap from outlier removal
+        at any track speed.
+        """
+        n   = self._n
+        cur = int(self._cursor)
+
+        best_d2  = np.inf
+        best_cum = cur
+        best_t   = 0.0
+
+        for ci in range(max(0, cur - 2), cur + max_advance + 1):
+            j = ci % n
+            k = (ci + 1) % n
+            ax, ay   = self._px[j], self._py[j]
+            bx, by   = self._px[k], self._py[k]
+            dab_x    = bx - ax
+            dab_y    = by - ay
+            len2     = dab_x * dab_x + dab_y * dab_y
+            if len2 < 0.1:
+                continue
+            t = ((raw_px - ax) * dab_x + (raw_py - ay) * dab_y) / len2
+            t = max(0.0, min(1.0, t))
+            nx = ax + t * dab_x
+            ny = ay + t * dab_y
+            d2 = (raw_px - nx) ** 2 + (raw_py - ny) ** 2
+            if d2 < best_d2:
+                best_d2  = d2
+                best_cum = ci
+                best_t   = t
+
+        self._cursor = best_cum + best_t
+
+        j = best_cum % n
+        k = (best_cum + 1) % n
+        x = self._px[j] + best_t * (self._px[k] - self._px[j])
+        y = self._py[j] + best_t * (self._py[k] - self._py[j])
+        return int(round(x)), int(round(y))
 
     def __call__(self, raw_px: float, raw_py: float) -> tuple:
         dx    = self._px - raw_px
