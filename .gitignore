@@ -1,0 +1,19 @@
+# Generated output (too large for git)
+*.mp4
+*.avi
+*.mov
+*_trace.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
