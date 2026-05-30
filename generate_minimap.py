@@ -51,7 +51,7 @@ def parse_gps_folder(folder: str) -> list:
                 m = _GPS_RE.search(line)
                 if m:
                     ts  = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
-                    rows.append((ts, float(m.group(2)), float(m.group(3))))
+                    rows.append((ts, float(m.group(2)), -float(m.group(3))))
     rows.sort(key=lambda r: r[0])
     seen, out = set(), []
     for r in rows:
@@ -106,9 +106,10 @@ class TrackProjector:
         self._cos = np.cos(np.radians(mean_lat))
         R = 111_111.0   # metres per degree
 
-        # GPS metric positions (east, north) relative to first corner
-        self._ge = np.array([-c["lon"] * self._cos * R for c in corners])
-        self._gn = np.array([ c["lat"]               * R for c in corners])
+        # GPS metric positions — lon is standard negative (W hemisphere)
+        # More positive lon = more east; ge increases eastward.
+        self._ge = np.array([c["lon"] * self._cos * R for c in corners])
+        self._gn = np.array([c["lat"]               * R for c in corners])
 
         # Canvas pixel positions
         self._px = np.array([c["px"] for c in corners], dtype=float)
@@ -116,8 +117,8 @@ class TrackProjector:
 
     def __call__(self, lat: float, lon: float) -> tuple[int, int]:
         R = 111_111.0
-        pe = -lon * self._cos * R
-        pn =  lat              * R
+        pe = lon * self._cos * R
+        pn = lat               * R
 
         best_d2   = np.inf
         best_x = self._px[0]
